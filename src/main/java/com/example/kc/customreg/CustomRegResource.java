@@ -6,7 +6,6 @@ import org.keycloak.models.*;
 import org.keycloak.models.credential.PasswordCredentialModel;
 import org.keycloak.models.utils.KeycloakModelUtils;
 import org.keycloak.common.util.Time;
-import org.keycloak.credential.CredentialModel;
 import org.keycloak.credential.hash.PasswordHashProvider;
 
 import jakarta.ws.rs.*;
@@ -15,6 +14,12 @@ import jakarta.ws.rs.core.Response;
 
 import java.util.*;
 
+/**
+ * Custom registration & password reset over phone OTP.
+ * - Username = phone number
+ * - Email is optional; NOT required to be verified for login
+ * - User can verify email later on demand
+ */
 @Path("/")
 @Consumes(MediaType.APPLICATION_JSON)
 @Produces(MediaType.APPLICATION_JSON)
@@ -77,7 +82,60 @@ public class CustomRegResource {
         return Response.ok(new VerifyRes(regToken, 300)).build();
     }
 
-    /* ======= Password reset ======= */
+    @POST
+    @Path("complete")
+    public Response complete(CompleteReq req) {
+        Map<String, Object> claims = JwtUtil.verifyRequire(session, req.regToken(), "typ", "reg");
+        String phone = (String) claims.get("phone");
+        if (phone == null)
+            return Response.status(400).entity(Map.of("error", "no_phone")).build();
+
+        RealmModel realm = session.getContext().getRealm();
+
+        // Prevent duplicates by phone_number
+        boolean exists = session.users()
+                .searchForUserByUserAttributeStream(realm, "phone_number", phone).findAny().isPresent();
+        if (exists)
+            return Response.status(409).entity(Map.of("error", "phone_exists")).build();
+
+        // Create user with username = phone
+        UserModel user = session.users().addUser(realm, KeycloakModelUtils.generateId());
+        user.setUsername(phone);
+        user.setEnabled(true);
+
+        if (req.email() != null && !req.email().isBlank()) {
+            user.setEmail(req.email());
+            // Cho phép đăng nhập ngay cả khi chưa xác minh email:
+            user.setEmailVerified(false);
+            // KHÔNG ép required action VERIFY_EMAIL — user có thể xác minh sau
+        }
+
+        if (req.firstName() != null)
+            user.setFirstName(req.firstName());
+        if (req.lastName() != null)
+            user.setLastName(req.lastName());
+
+        user.setSingleAttribute("phone_number", phone);
+        user.setSingleAttribute("phone_verified", "true"); // vì đã OTP
+
+        // Set password with current realm policy (Keycloak 26.x)
+        PasswordPolicy policy = realm.getPasswordPolicy();
+        PasswordHashProvider hashProvider = session.getProvider(PasswordHashProvider.class, policy.getHashAlgorithm());
+        PasswordCredentialModel hashedCredential = hashProvider.encodedCredential(req.password(),
+                policy.getHashIterations());
+        user.credentialManager().updateStoredCredential(hashedCredential);
+
+        // Emit register event
+        new EventBuilder(realm, session, session.getContext().getConnection())
+                .event(EventType.REGISTER)
+                .user(user)
+                .detail("method", "custom-http")
+                .success();
+
+        return Response.status(201).entity(Map.of("userId", user.getId())).build();
+    }
+
+    /* ======= Password reset (via phone OTP) ======= */
 
     public record ResetReq(String phone) {
     }
@@ -110,6 +168,7 @@ public class CustomRegResource {
                 new OtpRecord(u.getId(), code, Time.currentTime() + (int) ttlSec)));
         userOpt.ifPresent(u -> SmsGateway.send(session, phone, "OTP reset: " + code));
 
+        // Luôn trả về txnId (tránh lộ user tồn tại hay không)
         return Response.ok(Map.of("txnId", txnId, "expiresIn", ttlSec)).build();
     }
 
@@ -124,55 +183,10 @@ public class CustomRegResource {
 
         String resetToken = JwtUtil.issue(session, Map.of(
                 "typ", "reset",
-                "userId", rec.phone() /* here reused field to carry userId for reset store */
-        ), 600); // 10 minutes
+                // reuse OtpRecord.phone() field to carry userId in reset store (như comment
+                // gốc)
+                "userId", rec.phone()), 600); // 10 minutes
         return Response.ok(new ResetVerifyRes(resetToken, 600)).build();
-    }
-
-    @POST
-    @Path("complete")
-    public Response complete(CompleteReq req) {
-        Map<String, Object> claims = JwtUtil.verifyRequire(session, req.regToken(), "typ", "reg");
-        String phone = (String) claims.get("phone");
-        if (phone == null)
-            return Response.status(400).entity(Map.of("error", "no_phone")).build();
-
-        RealmModel realm = session.getContext().getRealm();
-        // Prevent duplicates by phone_number
-        boolean exists = session.users()
-                .searchForUserByUserAttributeStream(realm, "phone_number", phone).findAny().isPresent();
-        if (exists)
-            return Response.status(409).entity(Map.of("error", "phone_exists")).build();
-
-        String username = phone; // <-- login with phone number
-        UserModel user = session.users().addUser(realm, KeycloakModelUtils.generateId());
-        user.setUsername(username); // phone is the username
-        user.setEnabled(true);
-        if (req.email() != null)
-            user.setEmail(req.email());
-        if (req.firstName() != null)
-            user.setFirstName(req.firstName());
-        if (req.lastName() != null)
-            user.setLastName(req.lastName());
-        user.setSingleAttribute("phone_number", phone);
-        user.setSingleAttribute("phone_verified", "true");
-
-        // Set password - Keycloak 26.x approach using PasswordHashProvider
-        PasswordPolicy policy = realm.getPasswordPolicy();
-        PasswordHashProvider hashProvider = session.getProvider(PasswordHashProvider.class, policy.getHashAlgorithm());
-        PasswordCredentialModel hashedCredential = hashProvider.encodedCredential(req.password(),
-                policy.getHashIterations());
-
-        user.credentialManager().updateStoredCredential(hashedCredential);
-
-        // emit event
-        EventBuilder eb = new EventBuilder(realm, session, session.getContext().getConnection());
-        eb.event(EventType.REGISTER)
-                .user(user)
-                .detail("method", "custom-http")
-                .success();
-
-        return Response.status(201).entity(Map.of("userId", user.getId())).build();
     }
 
     @POST
@@ -188,21 +202,20 @@ public class CustomRegResource {
         if (user == null)
             return Response.status(404).build();
 
-        // Set new password - Keycloak 26.x approach using PasswordHashProvider
+        // Set new password
         PasswordPolicy policy = realm.getPasswordPolicy();
         PasswordHashProvider hashProvider = session.getProvider(PasswordHashProvider.class, policy.getHashAlgorithm());
         PasswordCredentialModel hashedCredential = hashProvider.encodedCredential(req.newPassword(),
                 policy.getHashIterations());
-
         user.credentialManager().updateStoredCredential(hashedCredential);
 
-        // revoke sessions
+        // Revoke online/offline sessions
         session.sessions().getUserSessionsStream(realm, user)
                 .forEach(s -> session.sessions().removeUserSession(realm, s));
         session.sessions().getOfflineUserSessionsStream(realm, user)
                 .forEach(s -> session.sessions().removeUserSession(realm, s));
 
-        // event
+        // Emit event
         new EventBuilder(realm, session, session.getContext().getConnection())
                 .event(EventType.RESET_PASSWORD)
                 .user(user)
