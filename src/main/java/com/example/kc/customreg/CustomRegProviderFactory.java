@@ -5,7 +5,7 @@ import org.keycloak.services.resource.RealmResourceProvider;
 import org.keycloak.services.resource.RealmResourceProviderFactory;
 
 public class CustomRegProviderFactory implements RealmResourceProviderFactory {
-    public static final String ID = "custom-reg"; // URL segment
+    public static final String ID = "customreg"; // URL segment
 
     @Override public RealmResourceProvider create(KeycloakSession session) {
         return new CustomRegProvider(session);

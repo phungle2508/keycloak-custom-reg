@@ -16,3 +16,12 @@ Meanwhile, the compiled output files will be generated in the `bin` folder by de
 ## Dependency Management
 
 The `JAVA PROJECTS` view allows you to manage your dependencies. More details can be found [here](https://github.com/microsoft/vscode-java-dependency#manage-dependencies).
+
+
+curl -X POST http://localhost:8080/realms/jhipster/protocol/openid-connect/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data client_id=web_app \
+  --data client_secret=6onB4vozC6BrDXZ2aYcynlkl78YvAAHh \
+  --data grant_type=password \
+  --data-urlencode 'username=+84382508253' \
+  --data-urlencode 'password=Secret123!'
