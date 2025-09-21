@@ -105,24 +105,29 @@ public class CustomRegResource {
 
         if (req.email() != null && !req.email().isBlank()) {
             user.setEmail(req.email());
-            // Cho phép đăng nhập ngay cả khi chưa xác minh email:
-            user.setEmailVerified(false);
-            // KHÔNG ép required action VERIFY_EMAIL — user có thể xác minh sau
+            user.setEmailVerified(false); // allow login even if not verified
         }
-
         if (req.firstName() != null)
             user.setFirstName(req.firstName());
         if (req.lastName() != null)
             user.setLastName(req.lastName());
 
         user.setSingleAttribute("phone_number", phone);
-        user.setSingleAttribute("phone_verified", "true"); // vì đã OTP
+        user.setSingleAttribute("phone_verified", "true");
 
-        // Set password with current realm policy (Keycloak 26.x)
+        // Set password with current realm policy or fallback
         PasswordPolicy policy = realm.getPasswordPolicy();
-        PasswordHashProvider hashProvider = session.getProvider(PasswordHashProvider.class, policy.getHashAlgorithm());
-        PasswordCredentialModel hashedCredential = hashProvider.encodedCredential(req.password(),
-                policy.getHashIterations());
+        String algo = policy != null ? policy.getHashAlgorithm() : null;
+        int iterations = policy != null ? policy.getHashIterations() : -1;
+        if (algo == null || iterations <= 0) {
+            algo = "pbkdf2-sha256";
+            iterations = 27500;
+        }
+
+        PasswordHashProvider hashProvider = session.getProvider(PasswordHashProvider.class, algo);
+        PasswordCredentialModel hashedCredential = hashProvider.encodedCredential(req.password(), iterations);
+
+        // This is correct for Keycloak 26.x
         user.credentialManager().updateStoredCredential(hashedCredential);
 
         // Emit register event
@@ -168,7 +173,6 @@ public class CustomRegResource {
                 new OtpRecord(u.getId(), code, Time.currentTime() + (int) ttlSec)));
         userOpt.ifPresent(u -> SmsGateway.send(session, phone, "OTP reset: " + code));
 
-        // Luôn trả về txnId (tránh lộ user tồn tại hay không)
         return Response.ok(Map.of("txnId", txnId, "expiresIn", ttlSec)).build();
     }
 
@@ -183,9 +187,7 @@ public class CustomRegResource {
 
         String resetToken = JwtUtil.issue(session, Map.of(
                 "typ", "reset",
-                // reuse OtpRecord.phone() field to carry userId in reset store (như comment
-                // gốc)
-                "userId", rec.phone()), 600); // 10 minutes
+                "userId", rec.phone()), 600); // reuse OtpRecord.phone() as userId
         return Response.ok(new ResetVerifyRes(resetToken, 600)).build();
     }
 
@@ -204,18 +206,24 @@ public class CustomRegResource {
 
         // Set new password
         PasswordPolicy policy = realm.getPasswordPolicy();
-        PasswordHashProvider hashProvider = session.getProvider(PasswordHashProvider.class, policy.getHashAlgorithm());
-        PasswordCredentialModel hashedCredential = hashProvider.encodedCredential(req.newPassword(),
-                policy.getHashIterations());
+        String algo = policy != null ? policy.getHashAlgorithm() : null;
+        int iterations = policy != null ? policy.getHashIterations() : -1;
+        if (algo == null || iterations <= 0) {
+            algo = "pbkdf2-sha256";
+            iterations = 27500;
+        }
+        PasswordHashProvider hashProvider = session.getProvider(PasswordHashProvider.class, algo);
+        PasswordCredentialModel hashedCredential = hashProvider.encodedCredential(req.newPassword(), iterations);
+
+        // Existing user → updateStoredCredential()
         user.credentialManager().updateStoredCredential(hashedCredential);
 
-        // Revoke online/offline sessions
+        // Revoke sessions
         session.sessions().getUserSessionsStream(realm, user)
                 .forEach(s -> session.sessions().removeUserSession(realm, s));
         session.sessions().getOfflineUserSessionsStream(realm, user)
                 .forEach(s -> session.sessions().removeUserSession(realm, s));
 
-        // Emit event
         new EventBuilder(realm, session, session.getContext().getConnection())
                 .event(EventType.RESET_PASSWORD)
                 .user(user)
